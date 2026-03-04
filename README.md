@@ -1,8 +1,24 @@
-# porto-listo
+<p align="center">
+  <img src="portolisto_logo.png" width="128" alt="PortoListo logo">
+</p>
 
-A lightweight macOS menu bar app that monitors your configured localhost ports and shows which are in use.
+<h1 align="center">PortoListo</h1>
 
-![macOS 13+](https://img.shields.io/badge/macOS-13%2B-blue)
+<p align="center">
+  A lightweight macOS menu bar app that monitors your configured localhost ports and shows which are in use.
+</p>
+
+<p align="center">
+  <img src="https://img.shields.io/badge/macOS-13%2B-blue" alt="macOS 13+">
+</p>
+
+## Screenshots
+
+<p align="center">
+  <img src="screenshots/main.png" width="340" alt="Main view">
+  <img src="screenshots/tooltip.png" width="340" alt="Tooltip details">
+  <img src="screenshots/settings.png" width="480" alt="Settings">
+</p>
 
 ## Features
 
