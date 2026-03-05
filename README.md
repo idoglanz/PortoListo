@@ -32,9 +32,18 @@
 
 ## Install
 
-Download the latest `.dmg` from [Releases](../../releases), open it, and drag **PortoListo** to Applications.
+1. Download the latest `.dmg` from [Releases](../../releases)
+2. Open it and drag **PortoListo** to Applications
+3. **Important:** On first launch, macOS will block the app because it isn't notarized. To open it:
+   - **Right-click** (or Control-click) on PortoListo in Applications
+   - Select **Open** from the context menu
+   - Click **Open** in the dialog that appears
+   - You only need to do this once — subsequent launches work normally
 
-> On first launch, macOS may warn about an unidentified developer. Right-click the app and select **Open** to bypass this.
+   Alternatively, remove the quarantine flag via Terminal:
+   ```bash
+   xattr -d com.apple.quarantine /Applications/PortoListo.app
+   ```
 
 ## Build from source
 
