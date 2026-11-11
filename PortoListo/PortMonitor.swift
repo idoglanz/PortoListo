@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import Darwin
 
 // MARK: - Models
 
@@ -67,35 +68,54 @@ struct WatchedPort: Identifiable, Codable, Hashable {
     }
 }
 
-struct ProcessInfo: Equatable {
+/// The process behind a listening port.
+nonisolated struct ProcessInfo: Equatable {
     let name: String
     let pid: Int
     let path: String?
     let startTime: Date?
     let memoryBytes: UInt64?
+    let workingDirectory: String?
+    /// What is running, in a few words ("vite · resource-planning", "redis · level").
+    let detail: String?
+    /// An Apple system service or a regular app's helper port: not shown unless pinned.
+    let isBackground: Bool
+    /// Docker / OrbStack / Rancher: its ports are named after their containers.
+    let isContainerRuntime: Bool
+
+    func with(detail: String) -> ProcessInfo {
+        ProcessInfo(name: name, pid: pid, path: path, startTime: startTime, memoryBytes: memoryBytes,
+                    workingDirectory: workingDirectory, detail: detail,
+                    isBackground: isBackground, isContainerRuntime: isContainerRuntime)
+    }
 }
 
 struct PortStatus: Identifiable, Equatable {
     var id: Int { port }
     let port: Int
-    let watchedPort: WatchedPort
+    /// The user's pinned entry covering this port; nil for a port found automatically.
+    let watchedPort: WatchedPort?
     let processInfo: ProcessInfo?
 
     var isActive: Bool { processInfo != nil }
+    var isPinned: Bool { watchedPort != nil }
+
+    /// The user's own label when they set one, otherwise what we detected.
+    var displayLabel: String {
+        if let label = watchedPort?.label, !label.isEmpty { return label }
+        return processInfo?.detail ?? ""
+    }
 }
 
 // MARK: - Errors
 
 enum PortMonitorError: LocalizedError {
-    case netstatFailed(exitCode: Int32, stderr: String)
-    case decodeFailed
+    case processListFailed(errno: Int32)
 
     var errorDescription: String? {
         switch self {
-        case .netstatFailed(let code, let stderr):
-            return "netstat failed (exit \(code)): \(stderr.prefix(200))"
-        case .decodeFailed:
-            return "Failed to decode netstat output"
+        case .processListFailed(let code):
+            return "Could not list processes: \(String(cString: strerror(code)))"
         }
     }
 }
@@ -104,9 +124,23 @@ enum PortMonitorError: LocalizedError {
 
 @MainActor
 class PortMonitor: ObservableObject {
+    /// Pinned ports (running or not) plus every other running server we discovered, by port.
     @Published private(set) var statuses: [PortStatus] = []
+    /// Pinned ports: always listed, with the user's labels.
     @Published private(set) var watchedPorts: [WatchedPort] = [] {
         didSet { save() }
+    }
+    /// List running servers that aren't pinned.
+    @Published var autoDiscover = true {
+        didSet { saveDiscoverySettings(); rebuildStatuses() }
+    }
+    /// Discovered ports the user hid.
+    @Published private(set) var hiddenPorts: Set<Int> = [] {
+        didSet { saveDiscoverySettings(); rebuildStatuses() }
+    }
+    /// Process names the user hid every port of.
+    @Published private(set) var hiddenProcesses: Set<String> = [] {
+        didSet { saveDiscoverySettings(); rebuildStatuses() }
     }
     @Published private(set) var lastRefreshed: Date?
     @Published private(set) var isRefreshing = false
@@ -120,6 +154,10 @@ class PortMonitor: ObservableObject {
 
     private var monitorTask: Task<Void, Never>?
     private var isLoading = false
+    private var listening: [Int: ProcessInfo] = [:]
+
+    /// The IANA dynamic range: ports the OS hands out on request, not ones you choose for a server.
+    private static let firstDynamicPort = 49152
 
     private var refreshInterval: Duration {
         isPopoverOpen ? .seconds(5) : .seconds(60)
@@ -151,16 +189,11 @@ class PortMonitor: ObservableObject {
         isRefreshing = true
 
         do {
-            let listening = try await fetchPortsViaNetstat()
+            listening = try await Task.detached(priority: .utility) {
+                try ProcessInspector.listeningPorts()
+            }.value
             lastError = nil
-
-            statuses = watchedPorts.flatMap { wp in
-                wp.ports.map { port in
-                    PortStatus(port: port, watchedPort: wp, processInfo: listening[port])
-                }
-            }
-            .sorted { $0.port < $1.port }
-
+            rebuildStatuses()
             lastRefreshed = Date()
         } catch {
             lastError = error.localizedDescription
@@ -171,19 +204,33 @@ class PortMonitor: ObservableObject {
 
     func addPort(_ wp: WatchedPort) {
         watchedPorts.append(wp)
+        rebuildStatuses()
         Task { await refresh() }
     }
 
     func removePort(withID id: UUID) {
         watchedPorts.removeAll { $0.id == id }
+        rebuildStatuses()
         Task { await refresh() }
     }
 
     func updatePort(_ updated: WatchedPort) {
         guard let index = watchedPorts.firstIndex(where: { $0.id == updated.id }) else { return }
         watchedPorts[index] = updated
+        rebuildStatuses()
         Task { await refresh() }
     }
+
+    /// Keep a discovered port listed even when it stops, under `label`.
+    func pin(port: Int, label: String) {
+        hiddenPorts.remove(port)
+        addPort(WatchedPort(value: String(port), label: label))
+    }
+
+    func hide(port: Int) { hiddenPorts.insert(port) }
+    func unhide(port: Int) { hiddenPorts.remove(port) }
+    func hide(processName: String) { hiddenProcesses.insert(processName) }
+    func unhide(processName: String) { hiddenProcesses.remove(processName) }
 
     func dismissError() {
         lastError = nil
@@ -191,134 +238,42 @@ class PortMonitor: ObservableObject {
 
     // MARK: - Private
 
-    /// Enrich a PID with executable path, start time, and memory usage via Darwin syscalls.
-    /// Cheap: 1-2 syscalls, no external processes. Returns nil fields on failure (e.g. other user's process).
-    private nonisolated static func enrichProcess(pid: Int32) -> (path: String?, startTime: Date?, memoryBytes: UInt64?) {
-        // Executable path via proc_pidpath
-        var pathBuffer = [CChar](repeating: 0, count: Int(MAXPATHLEN))
-        let pathLen = proc_pidpath(pid, &pathBuffer, UInt32(MAXPATHLEN))
-        let path: String? = pathLen > 0 ? String(cString: pathBuffer) : nil
+    /// Pinned ports first claim their port; every other running server is shown unless it is
+    /// system/app noise, on a dynamic port, or hidden.
+    private func rebuildStatuses() {
+        guard !isLoading else { return }
 
-        // Start time + memory via sysctl KERN_PROC_PID
-        var info = kinfo_proc()
-        var size = MemoryLayout<kinfo_proc>.size
-        var mib: [Int32] = [CTL_KERN, KERN_PROC, KERN_PROC_PID, pid]
-        let sysctlResult = sysctl(&mib, 4, &info, &size, nil, 0)
+        var rows: [Int: PortStatus] = [:]
+        for wp in watchedPorts {
+            for port in wp.ports where rows[port] == nil {
+                rows[port] = PortStatus(port: port, watchedPort: wp, processInfo: listening[port])
+            }
+        }
 
-        let startTime: Date? = (sysctlResult == 0 && size > 0) ? {
-            let tv = info.kp_proc.p_starttime
-            return Date(timeIntervalSince1970: Double(tv.tv_sec) + Double(tv.tv_usec) / 1_000_000)
-        }() : nil
+        if autoDiscover {
+            for (port, info) in listening where rows[port] == nil && shouldDiscover(port: port, info: info) {
+                rows[port] = PortStatus(port: port, watchedPort: nil, processInfo: info)
+            }
+        }
 
-        // Resident memory via proc_pidinfo PROC_PIDTASKINFO
-        var taskInfo = proc_taskinfo()
-        let taskInfoSize = Int32(MemoryLayout<proc_taskinfo>.size)
-        let taskResult = proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &taskInfo, taskInfoSize)
-        let memoryBytes: UInt64? = taskResult > 0 ? taskInfo.pti_resident_size : nil
-
-        return (path, startTime, memoryBytes)
+        statuses = rows.values.sorted { $0.port < $1.port }
     }
 
-    private func fetchPortsViaNetstat() async throws -> [Int: ProcessInfo] {
-        try await Task.detached {
-            let process = Process()
-            process.executableURL = URL(fileURLWithPath: "/usr/sbin/netstat")
-            process.arguments = ["-anv", "-p", "tcp"]
-
-            let stdoutPipe = Pipe()
-            let stderrPipe = Pipe()
-            process.standardOutput = stdoutPipe
-            process.standardError = stderrPipe
-
-            try process.run()
-
-            // Sequential reads are safe here: netstat output is well under the 64KB pipe buffer
-            let data = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            process.waitUntilExit()
-
-            if process.terminationStatus != 0 {
-                let stderrStr = String(data: stderrData, encoding: .utf8) ?? "unknown error"
-                throw PortMonitorError.netstatFailed(
-                    exitCode: process.terminationStatus,
-                    stderr: stderrStr
-                )
-            }
-
-            guard let output = String(data: data, encoding: .utf8) else {
-                throw PortMonitorError.decodeFailed
-            }
-
-            var result: [Int: ProcessInfo] = [:]
-
-            // netstat -anv columns:
-            // [0] Proto [1] Recv-Q [2] Send-Q [3] Local [4] Foreign [5] State
-            // [6..9] rwhi/shiwat [10] processname:pid [11] state
-            for line in output.components(separatedBy: "\n") {
-                guard !line.isEmpty,
-                      !line.hasPrefix("Active"),
-                      !line.hasPrefix("Proto") else { continue }
-
-                let cols = line.components(separatedBy: .whitespaces).filter { !$0.isEmpty }
-
-                guard cols.count >= 6,
-                      cols[0] == "tcp4" || cols[0] == "tcp46" || cols[0] == "tcp6",
-                      cols[5] == "LISTEN" else { continue }
-
-                // Local address format: "*.3000", "127.0.0.1.3000", "[::1].8080", etc.
-                let localAddr = cols[3]
-
-                let portStr: String
-                if localAddr.starts(with: "*.") {
-                    portStr = String(localAddr.dropFirst(2))
-                } else if localAddr.starts(with: "[") {
-                    if let closeBracket = localAddr.lastIndex(of: "]"),
-                       let dot = localAddr[closeBracket...].firstIndex(of: ".") {
-                        portStr = String(localAddr[localAddr.index(after: dot)...])
-                    } else {
-                        continue
-                    }
-                } else if let lastDot = localAddr.lastIndex(of: ".") {
-                    portStr = String(localAddr[localAddr.index(after: lastDot)...])
-                } else {
-                    continue
-                }
-
-                guard let port = Int(portStr) else { continue }
-
-                guard cols.count > 10 else { continue }
-                let processColumn = cols[10]
-                guard let colonIndex = processColumn.lastIndex(of: ":") else { continue }
-                let name = String(processColumn[..<colonIndex])
-                guard let pid = Int(String(processColumn[processColumn.index(after: colonIndex)...])),
-                      pid > 0 else { continue }
-
-                let enriched = PortMonitor.enrichProcess(pid: Int32(pid))
-                result[port] = ProcessInfo(
-                    name: name,
-                    pid: pid,
-                    path: enriched.path,
-                    startTime: enriched.startTime,
-                    memoryBytes: enriched.memoryBytes
-                )
-            }
-
-            return result
-        }.value
+    private func shouldDiscover(port: Int, info: ProcessInfo) -> Bool {
+        if hiddenPorts.contains(port) || hiddenProcesses.contains(info.name) { return false }
+        if port >= Self.firstDynamicPort { return false }
+        return !info.isBackground
     }
 
     // MARK: - Persistence
 
     private static let storageKey = "portolisto.watchedPorts"
+    private static let autoDiscoverKey = "portolisto.autoDiscover"
+    private static let hiddenPortsKey = "portolisto.hiddenPorts"
+    private static let hiddenProcessesKey = "portolisto.hiddenProcesses"
 
-    private static let defaultPorts: [WatchedPort] = [
-        WatchedPort(value: "3000", label: "React / Next.js"),
-        WatchedPort(value: "5173", label: "Vite"),
-        WatchedPort(value: "8080", label: "Backend"),
-        WatchedPort(value: "27017", label: "MongoDB"),
-        WatchedPort(value: "5432", label: "Postgres"),
-        WatchedPort(value: "6379", label: "Redis"),
-    ]
+    /// Nothing pinned on first launch: running servers show up on their own.
+    private static let defaultPorts: [WatchedPort] = []
 
     private func save() {
         guard !isLoading else { return }
@@ -330,9 +285,22 @@ class PortMonitor: ObservableObject {
         }
     }
 
+    private func saveDiscoverySettings() {
+        guard !isLoading else { return }
+        let defaults = UserDefaults.standard
+        defaults.set(autoDiscover, forKey: Self.autoDiscoverKey)
+        defaults.set(hiddenPorts.sorted(), forKey: Self.hiddenPortsKey)
+        defaults.set(hiddenProcesses.sorted(), forKey: Self.hiddenProcessesKey)
+    }
+
     private func load() {
         isLoading = true
         defer { isLoading = false }
+
+        let defaults = UserDefaults.standard
+        autoDiscover = defaults.object(forKey: Self.autoDiscoverKey) as? Bool ?? true
+        hiddenPorts = Set(defaults.array(forKey: Self.hiddenPortsKey) as? [Int] ?? [])
+        hiddenProcesses = Set(defaults.array(forKey: Self.hiddenProcessesKey) as? [String] ?? [])
 
         guard let data = UserDefaults.standard.data(forKey: Self.storageKey) else {
             // First launch — use defaults

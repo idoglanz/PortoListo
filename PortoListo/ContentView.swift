@@ -20,23 +20,23 @@ struct MenuBarView: View {
                 errorBanner(error)
             }
 
-            if monitor.watchedPorts.isEmpty {
-                emptyState
-            } else if monitor.lastRefreshed == nil {
+            if monitor.lastRefreshed == nil && monitor.lastError == nil {
                 ProgressView()
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if monitor.statuses.isEmpty {
+                emptyState
             } else {
                 ScrollView(.vertical, showsIndicators: false) {
                     VStack(alignment: .leading, spacing: 2) {
 
                         if !activeStatuses.isEmpty {
-                            SectionLabel(title: "ACTIVE PORTS", count: activeStatuses.count, color: .green)
+                            SectionLabel(title: "RUNNING", count: activeStatuses.count, color: .green)
                                 .padding(.top, 10)
                             ForEach(activeStatuses) { PortRow(status: $0, monitor: monitor) }
                         }
 
                         if !availableStatuses.isEmpty {
-                            SectionLabel(title: "AVAILABLE", count: availableStatuses.count, color: .secondary)
+                            SectionLabel(title: "PINNED, NOT RUNNING", count: availableStatuses.count, color: .secondary)
                                 .padding(.top, activeStatuses.isEmpty ? 10 : 8)
                             ForEach(availableStatuses) { PortRow(status: $0, monitor: monitor) }
                         }
@@ -145,10 +145,16 @@ struct MenuBarView: View {
             Image(systemName: "network.slash")
                 .font(.system(size: 28, weight: .thin))
                 .foregroundColor(Color.secondary.opacity(0.5))
-            Text("No ports configured")
+            Text(monitor.autoDiscover ? "Nothing running" : "No ports pinned")
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(.secondary)
-            Button("Add ports ->") { showSettings = true }
+            Text(monitor.autoDiscover
+                 ? "Servers you start show up here on their own."
+                 : "Pin ports, or turn on automatic discovery in Settings.")
+                .font(.system(size: 11))
+                .foregroundColor(Color.secondary.opacity(0.7))
+                .multilineTextAlignment(.center)
+            Button("Settings ->") { showSettings = true }
                 .buttonStyle(.plain)
                 .font(.system(size: 11))
                 .foregroundColor(.accentColor)
@@ -230,10 +236,19 @@ struct PortRow: View {
                                     .stroke(Color.accentColor.opacity(0.5), lineWidth: 1)
                             )
                             .onExitCommand { isEditingLabel = false }
-                    } else if !status.watchedPort.label.isEmpty {
-                        Text(status.watchedPort.label)
+                    } else if !status.displayLabel.isEmpty {
+                        Text(status.displayLabel)
                             .font(.system(size: 11))
                             .foregroundColor(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+
+                    if status.isPinned && !isEditingLabel {
+                        Image(systemName: "pin.fill")
+                            .font(.system(size: 8))
+                            .foregroundColor(Color.secondary.opacity(0.6))
+                            .help("Pinned: listed even when nothing is running")
                     }
                 }
 
@@ -264,17 +279,19 @@ struct PortRow: View {
             if isHovered && !isEditingLabel {
                 HStack(spacing: 6) {
                     // Edit label
-                    Button {
-                        labelDraft = status.watchedPort.label
+                    RowIconButton(icon: "pencil", help: status.isPinned ? "Edit label" : "Name this port (pins it)") {
+                        labelDraft = status.displayLabel
                         isEditingLabel = true
-                    } label: {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundColor(.secondary)
-                            .frame(width: 20, height: 20)
                     }
-                    .buttonStyle(.plain)
-                    .help("Edit label")
+
+                    if !status.isPinned {
+                        RowIconButton(icon: "pin", help: "Pin: keep listed even when it stops") {
+                            monitor.pin(port: status.port, label: status.displayLabel)
+                        }
+                        RowIconButton(icon: "eye.slash", help: "Hide port \(status.port) (right-click for more)") {
+                            monitor.hide(port: status.port)
+                        }
+                    }
 
                     // Open in browser (active ports only)
                     if status.isActive {
@@ -309,14 +326,39 @@ struct PortRow: View {
                 .fill(rowBg)
         )
         .help(isEditingLabel ? "" : tooltipText)
+        .contextMenu { contextMenuItems }
         .onHover { isHovered = $0 }
         .animation(.easeOut(duration: 0.12), value: isHovered)
     }
 
+    @ViewBuilder
+    private var contextMenuItems: some View {
+        if status.isActive {
+            Button("Open localhost:\(String(status.port))") { openInBrowser(port: status.port) }
+            Divider()
+        }
+        if let pinned = status.watchedPort {
+            Button(pinned.isRange ? "Unpin \(pinned.value)" : "Unpin") {
+                monitor.removePort(withID: pinned.id)
+            }
+        } else {
+            Button("Pin") { monitor.pin(port: status.port, label: status.displayLabel) }
+            Button("Hide port \(String(status.port))") { monitor.hide(port: status.port) }
+            if let name = status.processInfo?.name {
+                Button("Hide everything from \(name)") { monitor.hide(processName: name) }
+            }
+        }
+    }
+
+    /// Naming a discovered port pins it, so the name has somewhere to live.
     private func saveLabel() {
-        var updated = status.watchedPort
-        updated.label = labelDraft.trimmingCharacters(in: .whitespaces)
-        monitor.updatePort(updated)
+        let label = labelDraft.trimmingCharacters(in: .whitespaces)
+        if var updated = status.watchedPort {
+            updated.label = label
+            monitor.updatePort(updated)
+        } else {
+            monitor.pin(port: status.port, label: label)
+        }
         isEditingLabel = false
     }
 
@@ -335,8 +377,10 @@ struct PortRow: View {
         }
 
         let lines: [String?] = [
+            info.detail.map { "Running: \($0)" },
             "Process: \(info.name)",
             "PID: \(info.pid)",
+            info.workingDirectory.map { "Folder: \($0)" },
             info.path.map { "Path: \($0)" },
             info.startTime.map { "Uptime: \(Self.formatUptime(since: $0))" },
             info.memoryBytes.map { "Memory: \(Self.formatBytes($0))" },
@@ -369,6 +413,25 @@ struct PortRow: View {
     private func openInBrowser(port: Int) {
         guard let url = URL(string: "http://localhost:\(port)") else { return }
         NSWorkspace.shared.open(url)
+    }
+}
+
+// MARK: - Row Icon Button
+
+struct RowIconButton: View {
+    let icon: String
+    let help: String
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 10, weight: .medium))
+                .foregroundColor(.secondary)
+                .frame(width: 20, height: 20)
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 
@@ -422,7 +485,7 @@ struct HelpView: View {
             }
             .padding(.top, 4)
 
-            Text("A menu bar utility that monitors your configured localhost ports and shows which are in use. Add or remove ports in Settings -- only the ports you choose are monitored.")
+            Text("A menu bar utility that shows which localhost ports are in use and what is running on them. Dev servers show up on their own; system services and regular apps are left out. Pin a port to keep it listed when it stops.")
                 .font(.system(size: 12))
                 .foregroundColor(.secondary)
                 .multilineTextAlignment(.center)
@@ -430,7 +493,8 @@ struct HelpView: View {
 
             // Features
             VStack(alignment: .leading, spacing: 8) {
-                featureRow(icon: "eye", text: "Watch individual ports or ranges")
+                featureRow(icon: "sparkle.magnifyingglass", text: "Finds running dev servers and names them")
+                featureRow(icon: "pin", text: "Pin ports or ranges to always list them")
                 featureRow(icon: "gearshape", text: "See which process and PID owns each port")
                 featureRow(icon: "globe", text: "Open active ports in your browser")
                 featureRow(icon: "arrow.clockwise", text: "Auto-refreshes every few seconds")
@@ -444,7 +508,7 @@ struct HelpView: View {
                 .controlSize(.regular)
         }
         .padding(20)
-        .frame(width: 300, height: 380)
+        .frame(width: 300, height: 410)
     }
 
     private func featureRow(icon: String, text: String) -> some View {
