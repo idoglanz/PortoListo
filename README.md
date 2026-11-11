@@ -5,7 +5,7 @@
 <h1 align="center">PortoListo</h1>
 
 <p align="center">
-  A lightweight macOS menu bar app that monitors your configured localhost ports and shows which are in use.
+  A lightweight macOS menu bar app that shows which localhost ports are in use and what is running on them.
 </p>
 
 <p align="center">
@@ -22,13 +22,15 @@
 
 ## Features
 
-- Watch individual ports or ranges (e.g. `3000` or `3000-3010`)
-- See which process and PID owns each port
-- Tooltip with process path, uptime, and memory usage
+- Finds running dev servers on its own and names them: `vite · my-app`, `uvicorn · backend`, Docker ports by their compose service (`redis · level-app-backend`)
+- Leaves out macOS services, regular apps' helper ports (Spotify, VS Code…) and dynamic ports (49152+)
+- Hide a port, or everything from one process; unhide in Settings
+- Pin ports or ranges (e.g. `3000` or `3000-3010`) with your own labels to keep them listed when they stop
+- One line per port; hover a row for its process, PID, uptime and memory, plus pin / hide / open buttons
+- A pinned range with nothing running is listed once (`:3000–3010`)
+- Tooltip with what's running, working folder and process path
 - Open active ports in your browser with one click
-- Inline label editing from the main view
 - Auto-refreshes every 5s when open, 60s in background
-- Configure your port list in Settings
 
 ## Install
 
@@ -57,7 +59,7 @@ The built app will be in `~/Library/Developer/Xcode/DerivedData/PortoListo-*/Bui
 
 ## How it works
 
-PortoListo runs `netstat -anv -p tcp` to discover listening ports, then enriches each process with path, start time, and memory usage via lightweight Darwin syscalls (`proc_pidpath`, `sysctl`, `proc_pidinfo`). No root/sudo required.
+PortoListo walks each of your processes' open sockets through libproc (`proc_listallpids`, `proc_pidinfo`, `proc_pidfdinfo` — the same source `lsof` uses) to find TCP sockets in `LISTEN` state, then enriches each process with path, start time, and memory usage via lightweight Darwin syscalls (`proc_pidpath`, `sysctl`, `proc_pidinfo`). No root/sudo required.
 
 ## License
 

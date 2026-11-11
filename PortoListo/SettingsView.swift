@@ -13,9 +13,9 @@ struct SettingsView: View {
         VStack(spacing: 0) {
             HStack(alignment: .top) {
                 VStack(alignment: .leading, spacing: 3) {
-                    Text("Configure Ports")
+                    Text("Ports")
                         .font(.system(size: 15, weight: .bold, design: .rounded))
-                    Text("Watch individual ports or ranges like 3000-3005")
+                    Text("Pinned ports stay listed even when nothing runs on them")
                         .font(.system(size: 11))
                         .foregroundColor(.secondary)
                 }
@@ -27,6 +27,10 @@ struct SettingsView: View {
             .padding(.horizontal, 18)
             .padding(.top, 18)
             .padding(.bottom, 14)
+
+            Divider()
+
+            discoverySection
 
             Divider()
 
@@ -105,7 +109,58 @@ struct SettingsView: View {
             .padding(.horizontal, 18)
             .padding(.vertical, 14)
         }
-        .frame(width: 480, height: 420)
+        .frame(width: 480, height: 520)
+    }
+
+    // MARK: - Discovery
+
+    private var discoverySection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle(isOn: $monitor.autoDiscover) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Show other running servers automatically")
+                        .font(.system(size: 12, weight: .medium))
+                    Text("Skips macOS services, regular apps (Spotify, VS Code…) and ports above 49151")
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
+                }
+            }
+            .toggleStyle(.switch)
+            .controlSize(.small)
+
+            if monitor.autoDiscover {
+                if hiddenItems.isEmpty {
+                    Text("Hidden: none. Hide a port from its row in the menu (right-click for “Hide everything from…”).")
+                        .font(.system(size: 10))
+                        .foregroundColor(Color.secondary.opacity(0.8))
+                } else {
+                    HStack(alignment: .center, spacing: 6) {
+                        Text("Hidden")
+                            .font(.system(size: 10, weight: .medium))
+                            .foregroundColor(.secondary)
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 6) {
+                                ForEach(hiddenItems, id: \.title) { item in
+                                    HiddenChip(title: item.title, onRemove: item.unhide)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 12)
+    }
+
+    private var hiddenItems: [(title: String, unhide: () -> Void)] {
+        let ports = monitor.hiddenPorts.sorted().map { port in
+            (title: ":\(port)", unhide: { monitor.unhide(port: port) })
+        }
+        let processes = monitor.hiddenProcesses.sorted().map { name in
+            (title: name, unhide: { monitor.unhide(processName: name) })
+        }
+        return ports + processes
     }
 
     // MARK: - Empty State
@@ -224,5 +279,29 @@ struct PortListRow: View {
         .padding(.vertical, 3)
         .onHover { isHovered = $0 }
         .animation(.easeOut(duration: 0.15), value: isHovered)
+    }
+}
+
+// MARK: - Hidden Chip
+
+struct HiddenChip: View {
+    let title: String
+    let onRemove: () -> Void
+
+    var body: some View {
+        Button(action: onRemove) {
+            HStack(spacing: 4) {
+                Text(title)
+                    .font(.system(size: 11, design: .monospaced))
+                Image(systemName: "xmark")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .foregroundColor(.secondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Capsule().fill(Color.secondary.opacity(0.12)))
+        }
+        .buttonStyle(.plain)
+        .help("Show \(title) again")
     }
 }
