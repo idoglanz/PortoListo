@@ -8,13 +8,15 @@ struct MenuBarView: View {
     @State private var showHelp = false
 
     private var activeStatuses: [PortStatus] { monitor.statuses.filter { $0.isActive } }
-    /// Idle pinned ports, with a pinned range that has nothing running shown once rather than port by port.
+    /// Idle pinned ports. A pinned range is one row while nothing in it runs, and no row once
+    /// something does: its running port already stands for it.
     private var availableStatuses: [PortStatus] {
+        let runningRanges = Set(activeStatuses.compactMap { $0.watchedPort?.isRange == true ? $0.watchedPort?.id : nil })
         var seenRanges = Set<UUID>()
         return monitor.statuses.filter { status in
             guard !status.isActive else { return false }
             guard let wp = status.watchedPort, wp.isRange else { return true }
-            return seenRanges.insert(wp.id).inserted
+            return !runningRanges.contains(wp.id) && seenRanges.insert(wp.id).inserted
         }
     }
 
@@ -493,7 +495,7 @@ struct HelpView: View {
             VStack(alignment: .leading, spacing: 8) {
                 featureRow(icon: "sparkle.magnifyingglass", text: "Finds running dev servers and names them")
                 featureRow(icon: "pin", text: "Pin ports or ranges to always list them")
-                featureRow(icon: "gearshape", text: "See which process and PID owns each port")
+                featureRow(icon: "cursorarrow.rays", text: "Hover a row for its process, PID and uptime")
                 featureRow(icon: "globe", text: "Open active ports in your browser")
                 featureRow(icon: "arrow.clockwise", text: "Auto-refreshes every few seconds")
             }

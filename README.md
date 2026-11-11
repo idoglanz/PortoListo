@@ -26,8 +26,9 @@
 - Leaves out macOS services, regular apps' helper ports (Spotify, VS Code…) and dynamic ports (49152+)
 - Hide a port, or everything from one process; unhide in Settings
 - Pin ports or ranges (e.g. `3000` or `3000-3010`) with your own labels to keep them listed when they stop
-- See which process and PID owns each port
-- Tooltip with what's running, working folder, process path, uptime, and memory usage
+- One line per port; hover a row for its process, PID, uptime and memory, plus pin / hide / open buttons
+- A pinned range with nothing running is listed once (`:3000–3010`)
+- Tooltip with what's running, working folder and process path
 - Open active ports in your browser with one click
 - Auto-refreshes every 5s when open, 60s in background
 
